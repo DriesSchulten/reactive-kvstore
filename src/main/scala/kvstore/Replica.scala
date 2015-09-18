@@ -70,7 +70,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   val leader: Receive = LoggingReceive {
     case Insert(key, value, id) =>
-      kv += (key -> value)
+      kv += key -> value
       triggerPersistPrimairy(key, Some(value), id)
 
     case Remove(key, id) =>
@@ -110,10 +110,11 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         secondaries += ref -> replicator
         replicators += replicator
 
-        for {
-          (r, index) <- replicators.zipWithIndex
-          (k, v) <- kv
-        } yield r ! Replicate(k, Option(v), index)
+        replicators.zipWithIndex.foreach {
+          case (replicatorRef, index) => kv.foreach {
+            case (key, value) => replicatorRef ! Replicate(key, Option(value), index)
+          }
+        }
       }
 
     case Replicated(key, id) =>
@@ -137,7 +138,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
     case Snapshot(key, valueOpt, seq) =>
       if (seq == expectedSequence) {
         valueOpt match {
-          case Some(value) => kv += (key -> value)
+          case Some(value) => kv += key -> value
           case None => kv -= key
         }
         triggerPersist(key, valueOpt, seq)
