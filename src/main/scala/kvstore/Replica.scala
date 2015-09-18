@@ -1,9 +1,8 @@
 package kvstore
 
-import akka.actor.{Cancellable, Actor, ActorRef, Props}
+import akka.actor._
 import akka.event.LoggingReceive
 import kvstore.Arbiter._
-import kvstore.Replicator.{Snapshot, SnapshotAck}
 
 object Replica {
 
@@ -51,7 +50,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
 
-  // the persistent message we (tried to) send, but not yet persist acked
+  // the persistent message we (tried to) send, but not yet persist acked. Also including
+  // a possible set of replicator refs we want a 'replicated' message from
   var persistedSend = Map.empty[Long, (ActorRef, Option[Persist], Set[ActorRef])]
 
   var expectedSequence: Long = 0
@@ -88,10 +88,32 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       checkFinished(id)
 
     case Replicas(replicas) =>
-      replicas.filterNot(_ == self).foreach { ref =>
+      val removed = (secondaries.keySet -- replicas).filterNot(_ == self)
+      val added = (replicas -- secondaries.keySet).filterNot(_ == self)
+
+      removed.foreach { ref =>
+        val replicatorRef = secondaries(ref)
+        replicatorRef ! PoisonPill
+
+        secondaries -= ref
+        replicators -= replicatorRef
+
+        persistedSend.foreach {
+          case (id, (r, m, refs)) =>
+            persistedSend = persistedSend.updated(id, (r, m, refs - replicatorRef))
+            checkFinished(id)
+        }
+      }
+
+      added.foreach { ref =>
         val replicator = context.actorOf(Replicator.props(ref))
         secondaries += ref -> replicator
         replicators += replicator
+
+        for {
+          (r, index) <- replicators.zipWithIndex
+          (k, v) <- kv
+        } yield r ! Replicate(k, Option(v), index)
       }
 
     case Replicated(key, id) =>
@@ -118,14 +140,17 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
           case Some(value) => kv += (key -> value)
           case None => kv -= key
         }
-        expectedSequence += 1
         triggerPersist(key, valueOpt, seq)
       } else if (seq < expectedSequence) {
         sender ! SnapshotAck(key, seq)
       }
 
     case Persisted(key, seq) =>
-      persistedSend.get(seq).foreach { _._1 ! SnapshotAck(key, seq) }
+      persistedSend.get(seq).foreach {
+        case (r, _, _) =>
+          r ! SnapshotAck(key, seq)
+          expectedSequence += 1
+      }
       persistedSend -= seq
   }
 
